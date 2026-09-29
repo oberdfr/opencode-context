@@ -161,8 +161,14 @@ export const ContextPlugin = Plugin.define({
      * Rebuilds the tool-to-server map.
      *
      * MCP servers connect after plugin setup, so this is refreshed on every
-     * report rather than read once at load. A server that is not connected
-     * exposes no tools and contributes nothing, which is correct.
+     * report rather than read once at load.
+     *
+     * A server's *name* is recorded whatever its status, because a namespace
+     * appearing in the Code Mode catalogue means the prompt carries that
+     * server, and dropping a `pending` server here misfiled its whole
+     * description into the builtin bucket. Its *tools* are only recorded once
+     * connected, because an unconnected server exposes none and attributing
+     * them would invent a mapping that does not exist yet.
      */
     const refreshMcpOwners = async () => {
       try {
@@ -174,8 +180,8 @@ export const ContextPlugin = Plugin.define({
           // `status` is a tagged object on the wire.
           const status = server.status as { status?: string } | string | undefined;
           const state = typeof status === "string" ? status : status?.status;
-          if (state && state !== "connected") continue;
           names.add(server.name);
+          if (state && state !== "connected") continue;
           for (const tool of (server.tools ?? []) as { name?: unknown }[]) {
             if (typeof tool?.name === "string") owners.set(tool.name, server.name);
           }
@@ -480,7 +486,12 @@ export const ContextPlugin = Plugin.define({
           system: snapshot.system,
           tools: snapshot.tools,
           mcpTools: snapshot.mcpTools,
-          mcpNamespaces: snapshot.mcpNamespaces,
+          // The namespaces known now are unioned with the ones recorded when
+          // the capture was taken. Which servers exist is a property of the
+          // environment rather than of the prompt, so a capture restored from
+          // a previous run still gets attributed against the servers that are
+          // configured today.
+          mcpNamespaces: [...new Set([...(snapshot.mcpNamespaces ?? []), ...mcpNamespacesOwn])],
           messages: snapshot.messages,
           ...(tokenizer ? { tokenizer } : {}),
           ...(envelope !== undefined ? { envelope } : {}),

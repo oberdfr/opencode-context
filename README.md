@@ -159,6 +159,31 @@ Servers are matched by name, refreshed per report because MCP servers connect
 after plugin startup. A server that is not connected sends no tools and costs
 nothing.
 
+### Telling an MCP server's cost from a builtin's
+
+Under Code Mode an MCP tool is described in the prompt's catalogue rather than
+as a request-body definition, so a namespace in that catalogue is the only
+server identity available. A namespace is charged to MCP when the live MCP
+domain names it, or when the prompt declares it in `<mcp_instructions>`.
+
+Both sources matter, and neither alone is enough:
+
+- The live domain is complete, but a server that is still `connecting` reports
+  a status other than `connected`. Its *name* is still recorded, because a
+  namespace being in the catalogue means the prompt carries that server; its
+  *tools* are not, because an unconnected server exposes none.
+- The prompt is authoritative about itself, but its instructions block is
+  partial: in a real prompt only some servers document themselves.
+
+Reading a server's identity from the connection state alone is what made a
+whole namespace's description appear under builtins while the MCP row showed a
+cost with nothing to break it down into, and because that state was baked into
+the capture, it stayed wrong for every later visit to the session. The list of
+configured servers is a property of the environment rather than of the prompt,
+so a report unions the names known now with the ones recorded at capture time
+and a capture restored from an earlier run is attributed against today's
+servers.
+
 ### Remembering a session you switch back to
 
 A capture exists only once a session has actually made a request, and holding

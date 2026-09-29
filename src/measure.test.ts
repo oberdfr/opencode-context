@@ -492,6 +492,87 @@ describe("MCP attribution through the Code Mode catalogue", () => {
 });
 
 /**
+ * A catalogue namespace is in the prompt, so it is MCP whatever the connection
+ * happened to be doing when the request was made.
+ *
+ * The instructions block is not a complete list — in a real prompt only some
+ * servers document themselves — but a server that does declare itself is
+ * authoritative, and using it means a capture taken during a reconnect still
+ * attributes its cost instead of filing the whole description under builtins.
+ */
+const PROMPT_WITH_SERVERS = `${CATALOGUE}
+<mcp_instructions>
+  <server name="open-design">
+    Use tools from this server through \`execute\`.
+  </server>
+</mcp_instructions>
+`;
+
+describe("MCP attribution from the prompt's own server list", () => {
+  it("attributes a self-declared server even when the live list is empty", async () => {
+    const fromPrompt = await measure({
+      ...base(),
+      system: [{ text: PROMPT_WITH_SERVERS }],
+      // Nothing connected: this is the state that used to hide the whole
+      // namespace behind the builtin bucket.
+      mcpNamespaces: [],
+      tokenizer: countingTokenizer,
+    });
+    const mcp = fromPrompt.tools.filter((tool) => tool.mcp);
+    expect(mcp.length).toBeGreaterThan(0);
+    expect([...new Set(mcp.map((tool) => tool.server))]).toEqual(["open-design"]);
+
+    // Same text, but this time the server is named by the live list. Declaring
+    // it in the prompt has to reach the same answer, and reach it by moving
+    // cost out of the builtin bucket rather than by counting the same text
+    // twice.
+    const fromLiveList = await measure({
+      ...base(),
+      system: [{ text: PROMPT_WITH_SERVERS }],
+      mcpNamespaces: ["open-design"],
+      tokenizer: countingTokenizer,
+    });
+    expect(fromPrompt.categories.mcp).toBe(fromLiveList.categories.mcp);
+    expect(fromPrompt.categories.tools).toBe(fromLiveList.categories.tools);
+    expect(fromPrompt.measuredTotal).toBe(fromLiveList.measuredTotal);
+
+    const undeclared = await measure({
+      ...base(),
+      system: [{ text: CATALOGUE }],
+      mcpNamespaces: [],
+      tokenizer: countingTokenizer,
+    });
+    expect(undeclared.categories.mcp).toBe(0);
+  });
+
+  it("leaves a namespace the prompt does not declare as a builtin", async () => {
+    // `chrome-devtools` and `browser` are in the catalogue but declare nothing,
+    // so they stay builtin until the live list names them.
+    const result = await measure({
+      ...base(),
+      system: [{ text: PROMPT_WITH_SERVERS }],
+      mcpNamespaces: [],
+      tokenizer: countingTokenizer,
+    });
+    expect(result.tools.filter((tool) => !tool.mcp).map((tool) => tool.name)).toEqual(
+      expect.arrayContaining(["close_page", "list_pages", "list"]),
+    );
+  });
+
+  it("reads the declared names", () => {
+    const read = readSystemPart(PROMPT_WITH_SERVERS);
+    expect(read.mcpServers).toEqual(["open-design"]);
+  });
+
+  it("ignores a server entry that sits outside the instructions block", () => {
+    // The extraction is bounded by the block, so a stray match in a tool
+    // description cannot invent a connector.
+    const read = readSystemPart(`<available_skills>\nuse <server name="not-a-server">\n</available_skills>`);
+    expect(read.mcpServers).toEqual([]);
+  });
+});
+
+/**
  * The catalogue sits inside the system prompt's tool section, and the sections
  * that follow it — skills, memory files, the environment block — are counted in
  * their own categories. A catalogue that runs past its section claims those

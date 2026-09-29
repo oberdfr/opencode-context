@@ -255,6 +255,8 @@ export default Plugin.define({
      * for, and the dialog scrolls, so there is nothing left for one to protect.
      */
     const ItemList = (props: { title: string; items: ContextItem[]; unit: string; showServer?: boolean }) => {
+      // Solid compiles component props into getters, so reading `props.items`
+      // re-reads the signal and the list follows the current session.
       const items = () => props.items;
       return (
         <box flexDirection="column" marginTop={1}>
@@ -282,13 +284,17 @@ export default Plugin.define({
     const McpList = (props: { servers: { name: string; tokens: number; detail: string }[] }) => (
       <box flexDirection="column" marginTop={1}>
         <text fg={muted}>{strong("MCP connectors")}</text>
-        {props.servers.map((server) => (
-          <box flexDirection="row">
-            <text fg={theme.accent?.base ?? base}>{`  ${formatPath(server.name, ITEM_COLUMN).padEnd(ITEM_COLUMN)}`}</text>
-            <text fg={muted}>{`${formatTokens(server.tokens)} tokens  `}</text>
-            <text fg={muted} opacity={0.7}>{`${server.detail}`}</text>
-          </box>
-        ))}
+        {props.servers.length === 0 ? (
+          <text fg={muted} opacity={0.7}>{`  none`}</text>
+        ) : (
+          props.servers.map((server) => (
+            <box flexDirection="row">
+              <text fg={theme.accent?.base ?? base}>{`  ${formatPath(server.name, ITEM_COLUMN).padEnd(ITEM_COLUMN)}`}</text>
+              <text fg={muted}>{`${formatTokens(server.tokens)} tokens  `}</text>
+              <text fg={muted} opacity={0.7}>{`${server.detail}`}</text>
+            </box>
+          ))
+        )}
       </box>
     );
 
@@ -479,7 +485,7 @@ export default Plugin.define({
               <ItemList title="Memory files" items={report().memoryFiles} unit="tokens" />
               <ItemList title="Skills" items={report().skills} unit="tokens" />
 
-              {mcpServers().length > 0 ? <McpList servers={mcpServers()} /> : null}
+              <McpList servers={mcpServers()} />
 
               <ItemList title="Tools" items={builtinTools()} unit="tokens" />
 

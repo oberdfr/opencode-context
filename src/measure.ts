@@ -308,6 +308,8 @@ const DATE_OPEN = /^Today's date:/;
 /** Opens the block of MCP server instructions, when any server is connected. */
 const MCP_OPEN = /^<mcp_instructions>/;
 const MCP_CLOSE = /^<\/mcp_instructions>/;
+/** A declared MCP server inside the instructions block. */
+const MCP_SERVER = /<server\s+name="([^"]+)"/;
 
 function opensOtherSection(line: string): boolean {
   return (
@@ -361,6 +363,16 @@ export interface SystemRead {
   sectionSpans: SectionSpan[];
   memoryFiles: MemorySpan[];
   skills: SkillSpan[];
+  /**
+   * MCP server names the prompt itself declares.
+   *
+   * Read from the `<server name="...">` entries inside `<mcp_instructions>`.
+   * The prompt is authoritative about which servers it carries, whereas the
+   * live MCP domain also reports servers that have not finished connecting —
+   * and a namespace that is present in the catalogue is in the prompt whatever
+   * the connection happens to be doing at the moment of the request.
+   */
+  mcpServers: string[];
 }
 
 /**
@@ -376,6 +388,7 @@ export function readSystemPart(text: string): SystemRead {
   const memoryFiles: MemorySpan[] = [];
   const skills: SkillSpan[] = [];
   const sectionSpans: SectionSpan[] = [];
+  const mcpServers: string[] = [];
 
   let start = 0;
   let category: Category = "system";
@@ -436,6 +449,15 @@ export function readSystemPart(text: string): SystemRead {
       return;
     }
 
+    // A server is declared in the prompt, so its name is read from there rather
+    // than from the connection state at the time of the request.
+    if (category === "mcp") {
+      const declared = MCP_SERVER.exec(line);
+      if (declared?.[1] && !mcpServers.includes(declared[1])) mcpServers.push(declared[1]);
+      // The block ends here, so nothing after it can declare a server.
+      if (MCP_CLOSE.test(line)) openSection(index + 1, "system");
+    }
+
     if (ENV_OPEN.test(line) || ENV_CLOSE.test(line) || DATE_OPEN.test(line)) {
       closeFile(index);
       openSection(index, "environment");
@@ -453,7 +475,7 @@ export function readSystemPart(text: string): SystemRead {
   closeFile(lines.length);
   if (catalogue) skills.push(...parseSkillCatalogue(catalogue.join("\n")));
 
-  return { lines, sectionSpans, memoryFiles, skills };
+  return { lines, sectionSpans, memoryFiles, skills, mcpServers };
 }
 
 function schemaText(input: unknown): string {
@@ -511,8 +533,15 @@ export async function measure(input: {
   const tools: ToolEntry[] = [];
   const mcpTools = input.mcpTools ?? {};
   // A namespace name is its own server: the catalogue carries no other server
-  // identity, and these names come from the MCP domain.
+  // identity. Names come from two places that agree on the identity — the live
+  // MCP domain, and the servers the prompt declares for itself. The prompt is
+  // the one that matters here, because a namespace being in the catalogue at
+  // all means the prompt carries it, regardless of whether the server had
+  // finished connecting when the request was made. A capture taken during a
+  // reconnect therefore still attributes its MCP cost.
   const mcpNamespaces = new Set(input.mcpNamespaces ?? []);
+  /** Servers the prompt declares, filled in as the system parts are read. */
+  const declaredServers = new Set<string>();
 
   // Totals the catalogue section is replaced by, accumulated across parts.
   let catalogMcp = 0;
@@ -522,6 +551,7 @@ export async function measure(input: {
   for (const part of input.system ?? []) {
     const text = part?.text ?? "";
     const read = readSystemPart(text);
+    for (const server of read.mcpServers) declaredServers.add(server);
 
     for (const span of read.sectionSpans) {
       if (span.category !== "tools") {
@@ -573,7 +603,7 @@ export async function measure(input: {
   // Per-namespace and per-tool cost of the catalogue.
   for (const catalog of catalogs) {
     for (const namespace of catalog.namespaces) {
-      const isMcp = mcpNamespaces.has(namespace.name);
+      const isMcp = mcpNamespaces.has(namespace.name) || declaredServers.has(namespace.name);
       for (const entry of namespace.tools) {
         const tokens = await count.count(entry.text);
         const name = entry.path.split(".").pop() ?? entry.path;
