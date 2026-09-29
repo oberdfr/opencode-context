@@ -18,6 +18,8 @@
  */
 
 import { Plugin } from "@opencode/plugin";
+import type { Context } from "@opencode/plugin/promise/plugin";
+import type { StorageDomain } from "@opencode/plugin/promise/storage";
 import { ContextRpc, type ContextReport } from "./rpc.ts";
 import { measure, reconcile, resolveTokenizer, type Measurement } from "./measure.ts";
 import { parseRequestBody } from "./body.ts";
@@ -66,11 +68,90 @@ function remember<T>(map: Map<string, T>, key: string, value: T, limit: number):
   }
 }
 
+/** Storage key for a session's captured prompt. */
+const snapshotKey = (sessionID: string) => `context-snapshot/${sessionID}`;
+
+/** How many sessions are kept on disk. */
+const MAX_PERSISTED = 8;
+
+/** A captured prompt larger than this is not worth writing to disk. */
+const MAX_PERSIST_BYTES = 1_000_000;
+
+/**
+ * The part of a snapshot worth keeping across restarts.
+ *
+ * The raw request body is dropped: it is by far the largest field and is used
+ * only for the framing figure, which is a nice-to-have that the report simply
+ * omits when it is unavailable.
+ */
+type PersistedSnapshot = Omit<Snapshot, "body">;
+
 export const ContextPlugin = Plugin.define({
   id: PLUGIN_ID,
   async setup(ctx) {
     const options = (ctx.options ?? {}) as Options;
     const snapshots = new Map<string, Snapshot>();
+    /**
+     * Writes a capture through to durable storage.
+     *
+     * Failures are swallowed on purpose: persistence is a convenience that
+     * makes a session readable after a restart, never a correctness
+     * requirement, and it must not affect the capture it follows.
+     */
+    const persist = async (storage: StorageDomain, sessionID: string, snapshot: Snapshot) => {
+      try {
+        const { body: _body, ...durable } = snapshot;
+        const encoded = JSON.stringify(durable);
+        // A session that has grown a very long transcript is not worth the
+        // disk; it still reports in memory while it is the active session.
+        if (encoded.length > MAX_PERSIST_BYTES) return;
+        await storage.set(snapshotKey(sessionID), JSON.parse(encoded));
+        await prune(storage);
+      } catch {
+        // Nothing to do; the in-memory capture is unaffected.
+      }
+    };
+
+    /** Drops all but the most recently captured sessions from disk. */
+    const prune = async (storage: StorageDomain) => {
+      try {
+        const found = await storage.scan({ prefix: "context-snapshot/", limit: 200 });
+        const entries = [...found.entries];
+        if (entries.length <= MAX_PERSISTED) return;
+        const withTime = entries
+          .map((entry) => {
+            const value = entry.value as { capturedAt?: unknown } | null;
+            return { key: entry.key, at: typeof value?.capturedAt === "number" ? value.capturedAt : 0 };
+          })
+          .sort((a, b) => a.at - b.at);
+        for (const stale of withTime.slice(0, withTime.length - MAX_PERSISTED)) {
+          await storage.remove(stale.key);
+        }
+      } catch {
+        // Pruning is housekeeping; leaving extra entries costs disk, not
+        // correctness.
+      }
+    };
+
+    /**
+     * Restores a capture from a previous run.
+     *
+     * This is what makes `/context` work for a chat you switch back to: the
+     * prompt that produced its window was captured when it last ran, and
+     * survives even though the in-memory window has moved on.
+     */
+    const restore = async (sessionID: string): Promise<Snapshot | undefined> => {
+      try {
+        const raw = await ctx.storage.get(snapshotKey(sessionID));
+        if (raw === undefined || raw === null) return undefined;
+        const parsed = raw as unknown as PersistedSnapshot;
+        if (!Array.isArray(parsed.system) || !Array.isArray(parsed.messages)) return undefined;
+        return { ...parsed, mcpNamespaces: parsed.mcpNamespaces ?? [] } as Snapshot;
+      } catch {
+        return undefined;
+      }
+    };
+
     /** Tool name to MCP server, refreshed as servers connect. */
     let mcpOwners = new Map<string, string>();
     /** Names of connected MCP servers, which is what a catalogue namespace matches. */
@@ -138,10 +219,7 @@ export const ContextPlugin = Plugin.define({
         // the text it came from; here only the server names are needed.
         const mcpNamespaces = [...mcpNamespacesOwn];
 
-        remember(
-          snapshots,
-          request.sessionID,
-          {
+        const snapshot: Snapshot = {
             system: parsed.system,
             tools: parsed.tools,
             mcpTools,
@@ -154,9 +232,11 @@ export const ContextPlugin = Plugin.define({
             // Counting it here would put a BPE pass over every kilobyte of
             // every request on the path out to the provider.
             body: text,
-          },
-          MAX_SNAPSHOTS,
-        );
+        };
+        remember(snapshots, request.sessionID, snapshot, MAX_SNAPSHOTS);
+        // Written through so the capture survives a server restart and survives
+        // being evicted from the in-memory window.
+        void persist(ctx.storage, request.sessionID, snapshot);
       } catch {
         // An unreadable body must not take the session down; the next request
         // overwrites the snapshot anyway.
@@ -242,6 +322,32 @@ export const ContextPlugin = Plugin.define({
       return undefined;
     };
 
+    /**
+     * The model a session is on, preferring the captured one.
+     *
+     * A session that has run in this process carries its model on the capture.
+     * One that has not — because it last ran before a restart, or its capture
+     * was evicted — still records it on the session itself, so the window and
+     * the gauge do not depend on having captured a prompt.
+     */
+    const resolveSessionModel = async (
+      c: Context,
+      sessionID: string,
+      captured: { providerID: string; modelID: string } | undefined,
+    ): Promise<{ providerID: string; modelID: string } | undefined> => {
+      if (captured) return captured;
+      try {
+        const info = await c.session.get({ sessionID });
+        const model = info?.model as { id?: unknown; providerID?: unknown } | undefined;
+        if (typeof model?.id === "string" && typeof model?.providerID === "string") {
+          return { providerID: model.providerID, modelID: model.id };
+        }
+      } catch {
+        // A session the store cannot resolve simply has no model to report.
+      }
+      return undefined;
+    };
+
     /** The window the model allows. */
     const resolveLimit = async (model: { providerID: string; modelID: string } | undefined): Promise<number> => {
       if (!model) return 0;
@@ -293,18 +399,37 @@ export const ContextPlugin = Plugin.define({
         }
 
         await refreshMcpOwners();
-        const snapshot = snapshots.get(sessionID);
+        // In memory first, then the durable copy, so switching to a chat that
+        // last ran before a restart still reports instead of coming up empty.
+        let snapshot = snapshots.get(sessionID);
         // Reading counts as use, so the snapshot survives the eviction sweep.
         if (snapshot) remember(snapshots, sessionID, snapshot, MAX_SNAPSHOTS);
+        let restored = false;
+        if (!snapshot) {
+          snapshot = await restore(sessionID);
+          restored = snapshot !== undefined;
+          if (snapshot) remember(snapshots, sessionID, snapshot, MAX_SNAPSHOTS);
+        }
 
         const notes: string[] = [];
         const reported = await reportedUsage(sessionID);
-        const limit = await resolveLimit(snapshot?.model);
+
+        /**
+         * The model, which does not depend on having captured a prompt.
+         *
+         * The session record carries it whether or not this process ever saw a
+         * request for the session, so the window and the gauge are known even
+         * when the prompt itself has not been measured.
+         */
+        const modelRef = await resolveSessionModel(ctx, sessionID, snapshot?.model);
+        const limit = await resolveLimit(modelRef);
         const compaction = resolveCompaction(limit);
-        const model = snapshot?.model ? `${snapshot.model.providerID}/${snapshot.model.modelID}` : undefined;
+        const model = modelRef ? `${modelRef.providerID}/${modelRef.modelID}` : undefined;
 
         if (!snapshot) {
-          notes.push("This session has not run a model request yet, so the prompt has not been measured.");
+          notes.push("This session's prompt has not been captured, so only the provider's own reading is shown. Send a message to measure the breakdown.");
+        } else if (restored) {
+          notes.push("Restored from a previous run; the breakdown reflects the prompt as it was then.");
         } else if (!snapshot.fromBody) {
           notes.push("Read from the prompt rather than the request body, so figures may differ slightly from the provider's.");
         }
@@ -337,7 +462,6 @@ export const ContextPlugin = Plugin.define({
 
         if (!snapshot) return respond(undefined);
 
-        const modelRef = snapshot.model;
         const tokenizer = modelRef ? await resolveTokenizer(modelRef.providerID, modelRef.modelID) : undefined;
 
         // Counted here rather than at capture time: this runs only when someone

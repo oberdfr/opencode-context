@@ -159,8 +159,24 @@ Servers are matched by name, refreshed per report because MCP servers connect
 after plugin startup. A server that is not connected sends no tools and costs
 nothing.
 
-Snapshots are kept for the last 8 sessions and evicted least-recently-used, so
-an idle server holds nothing unbounded.
+### Remembering a session you switch back to
+
+A capture exists only once a session has actually made a request, and holding
+one for every session ever seen would be unbounded. Both limits are handled
+without making `/context` come up empty:
+
+- The last 8 captures are kept in memory, least-recently-used evicted.
+- Captures are also written through to durable storage, and the 8 most recent
+  are kept there, so they survive a server restart. The raw request body is
+  dropped before writing: it is the largest field and only feeds the framing
+  figure, which the report simply omits when it is unavailable. A capture whose
+  transcript is over 1 MB is not written at all.
+
+The model never depends on a capture. A session records the model it is on
+whether or not this process ever saw a request for it, so switching to a chat
+that last ran before a restart still names the model, knows the window, and
+shows the provider's own total. Only the breakdown needs a capture, and its
+absence is stated in the dialog rather than shown as zero.
 
 ### The compaction marker
 
